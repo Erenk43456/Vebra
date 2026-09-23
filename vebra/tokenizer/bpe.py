@@ -105,6 +105,12 @@ class BPETrainer:
         # Current number of occurrences of every adjacent token pair.
         pair_counts: Counter[tuple[int, int]] = Counter()
 
+        # count -> pairs having exactly this count
+        pair_buckets: dict[int, set[tuple[int, int]]] = {}
+
+        # Highest currently populated pair-count bucket.
+        max_pair_count = 0
+
         # pair -> {(sequence_index, left_node_index), ...}
         #
         # An occurrence identifies the node containing the left token
@@ -114,6 +120,46 @@ class BPETrainer:
             set[tuple[int, int]],
         ] = {}
 
+        def adjust_pair_count(
+            pair: tuple[int, int],
+            delta: int,
+        ) -> None:
+            nonlocal max_pair_count
+
+            old_count = pair_counts.get(pair, 0)
+            new_count = old_count + delta
+
+            if new_count < 0:
+                raise RuntimeError(
+                    "internal BPE pair count underflow"
+                )
+
+            if old_count > 0:
+                bucket = pair_buckets[old_count]
+                bucket.remove(pair)
+
+                if not bucket:
+                    pair_buckets.pop(old_count)
+
+            if new_count == 0:
+                pair_counts.pop(pair, None)
+            else:
+                pair_counts[pair] = new_count
+
+                pair_buckets.setdefault(
+                    new_count,
+                    set(),
+                ).add(pair)
+
+                if new_count > max_pair_count:
+                    max_pair_count = new_count
+
+            while (
+                max_pair_count > 0
+                and max_pair_count not in pair_buckets
+            ):
+                max_pair_count -= 1
+
         for sequence_index, sequence_nodes in enumerate(nodes):
             for index in range(len(sequence_nodes) - 1):
                 left = int(sequence_nodes[index]["token"])
@@ -121,9 +167,12 @@ class BPETrainer:
 
                 pair = (left, right)
 
-                pair_counts[pair] += 1
+                adjust_pair_count(pair, 1)
 
-                pair_occurrences.setdefault(pair, set()).add(
+                pair_occurrences.setdefault(
+                    pair,
+                    set(),
+                ).add(
                     (sequence_index, index)
                 )
 
@@ -145,9 +194,10 @@ class BPETrainer:
             pair: tuple[int, int],
             occurrence: tuple[int, int],
         ) -> None:
-            pair_occurrences.setdefault(pair, set()).add(
-                occurrence
-            )
+            pair_occurrences.setdefault(
+                pair,
+                set(),
+            ).add(occurrence)
 
         def remove_pair_occurrence(
             sequence_index: int,
@@ -174,14 +224,7 @@ class BPETrainer:
                 int(right_node["token"]),
             )
 
-            count = pair_counts[pair]
-
-            if count <= 0:
-                raise RuntimeError(
-                    "internal BPE pair count underflow"
-                )
-
-            pair_counts[pair] = count - 1
+            adjust_pair_count(pair, -1)
 
             remove_occurrence(
                 pair,
@@ -213,7 +256,7 @@ class BPETrainer:
                 int(right_node["token"]),
             )
 
-            pair_counts[pair] += 1
+            adjust_pair_count(pair, 1)
 
             add_occurrence(
                 pair,
@@ -221,23 +264,15 @@ class BPETrainer:
             )
 
         while len(vocab) < self.vocab_size:
-            candidates = [
-                (pair, count)
-                for pair, count in pair_counts.items()
-                if count >= self.min_frequency
-            ]
-
-            if not candidates:
+            if max_pair_count < self.min_frequency:
                 break
 
-            best_pair, _ = max(
-                candidates,
-                key=lambda item: (
-                    item[1],
-                    -item[0][0],
-                    -item[0][1],
-                ),
-            )
+            bucket = pair_buckets[max_pair_count]
+
+            # Preserve the original deterministic tie-break:
+            # highest count, then highest left token ID,
+            # then highest right token ID.
+            best_pair = max(bucket)
 
             left_token, right_token = best_pair
 
@@ -380,6 +415,7 @@ class BPETrainer:
             next_token_id += 1
 
         return vocab, merges
+
 
 class BPETokenizer:
     def __init__(
