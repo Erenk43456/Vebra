@@ -66,11 +66,6 @@ class BPETrainer:
         if not sequences:
             raise ValueError("sequences must not be empty")
 
-        working_sequences = [
-            list(sequence)
-            for sequence in sequences
-        ]
-
         vocab: dict[int, bytes] = {
             token_id: bytes([token_id])
             for token_id in range(256)
@@ -79,12 +74,153 @@ class BPETrainer:
         merges: list[tuple[int, int]] = []
         next_token_id = 256
 
+        # Mutable linked representation of every sequence.
+        #
+        # Each node contains:
+        #   token -> token ID
+        #   prev  -> previous node index
+        #   next  -> next node index
+        #   alive -> whether the node is still active
+        nodes: list[list[dict[str, int | bool]]] = []
+
+        for sequence in sequences:
+            sequence_nodes: list[dict[str, int | bool]] = []
+
+            for index, token in enumerate(sequence):
+                sequence_nodes.append(
+                    {
+                        "token": token,
+                        "prev": index - 1,
+                        "next": (
+                            index + 1
+                            if index + 1 < len(sequence)
+                            else -1
+                        ),
+                        "alive": True,
+                    }
+                )
+
+            nodes.append(sequence_nodes)
+
+        # Current number of occurrences of every adjacent token pair.
+        pair_counts: Counter[tuple[int, int]] = Counter()
+
+        # pair -> {(sequence_index, left_node_index), ...}
+        #
+        # An occurrence identifies the node containing the left token
+        # of the pair.
+        pair_occurrences: dict[
+            tuple[int, int],
+            set[tuple[int, int]],
+        ] = {}
+
+        for sequence_index, sequence_nodes in enumerate(nodes):
+            for index in range(len(sequence_nodes) - 1):
+                left = int(sequence_nodes[index]["token"])
+                right = int(sequence_nodes[index + 1]["token"])
+
+                pair = (left, right)
+
+                pair_counts[pair] += 1
+
+                pair_occurrences.setdefault(pair, set()).add(
+                    (sequence_index, index)
+                )
+
+        def remove_occurrence(
+            pair: tuple[int, int],
+            occurrence: tuple[int, int],
+        ) -> None:
+            occurrences = pair_occurrences.get(pair)
+
+            if occurrences is None:
+                return
+
+            occurrences.discard(occurrence)
+
+            if not occurrences:
+                pair_occurrences.pop(pair, None)
+
+        def add_occurrence(
+            pair: tuple[int, int],
+            occurrence: tuple[int, int],
+        ) -> None:
+            pair_occurrences.setdefault(pair, set()).add(
+                occurrence
+            )
+
+        def remove_pair_occurrence(
+            sequence_index: int,
+            left_index: int,
+        ) -> None:
+            sequence_nodes = nodes[sequence_index]
+            left_node = sequence_nodes[left_index]
+
+            if not bool(left_node["alive"]):
+                return
+
+            right_index = int(left_node["next"])
+
+            if right_index == -1:
+                return
+
+            right_node = sequence_nodes[right_index]
+
+            if not bool(right_node["alive"]):
+                return
+
+            pair = (
+                int(left_node["token"]),
+                int(right_node["token"]),
+            )
+
+            count = pair_counts[pair]
+
+            if count <= 0:
+                raise RuntimeError(
+                    "internal BPE pair count underflow"
+                )
+
+            pair_counts[pair] = count - 1
+
+            remove_occurrence(
+                pair,
+                (sequence_index, left_index),
+            )
+
+        def add_pair_occurrence(
+            sequence_index: int,
+            left_index: int,
+        ) -> None:
+            sequence_nodes = nodes[sequence_index]
+            left_node = sequence_nodes[left_index]
+
+            if not bool(left_node["alive"]):
+                return
+
+            right_index = int(left_node["next"])
+
+            if right_index == -1:
+                return
+
+            right_node = sequence_nodes[right_index]
+
+            if not bool(right_node["alive"]):
+                return
+
+            pair = (
+                int(left_node["token"]),
+                int(right_node["token"]),
+            )
+
+            pair_counts[pair] += 1
+
+            add_occurrence(
+                pair,
+                (sequence_index, left_index),
+            )
+
         while len(vocab) < self.vocab_size:
-            pair_counts = self.count_pairs(working_sequences)
-
-            if not pair_counts:
-                break
-
             candidates = [
                 (pair, count)
                 for pair, count in pair_counts.items()
@@ -103,27 +239,143 @@ class BPETrainer:
                 ),
             )
 
-            left, right = best_pair
+            left_token, right_token = best_pair
 
-            if left not in vocab or right not in vocab:
+            if left_token not in vocab or right_token not in vocab:
                 raise ValueError(
                     "pair contains unknown token"
                 )
 
             vocab[next_token_id] = (
-                vocab[left] + vocab[right]
+                vocab[left_token] + vocab[right_token]
             )
 
             merges.append(best_pair)
 
-            working_sequences = [
-                self.merge_pair(
-                    sequence,
-                    best_pair,
-                    next_token_id,
+            occurrences = pair_occurrences.get(best_pair)
+
+            if not occurrences:
+                raise RuntimeError(
+                    "best BPE pair has no occurrences"
                 )
-                for sequence in working_sequences
-            ]
+
+            # Work from left to right to preserve the exact
+            # non-overlapping semantics of merge_pair().
+            selected: list[tuple[int, int]] = []
+
+            last_consumed_right: dict[int, int] = {}
+
+            for sequence_index, left_index in sorted(
+                occurrences
+            ):
+                previous_right = last_consumed_right.get(
+                    sequence_index,
+                    -1,
+                )
+
+                # If this node was consumed as the right side of
+                # the preceding occurrence, this occurrence overlaps
+                # and must be skipped.
+                if left_index <= previous_right:
+                    continue
+
+                sequence_nodes = nodes[sequence_index]
+                left_node = sequence_nodes[left_index]
+
+                if not bool(left_node["alive"]):
+                    continue
+
+                right_index = int(left_node["next"])
+
+                if right_index == -1:
+                    continue
+
+                right_node = sequence_nodes[right_index]
+
+                if not bool(right_node["alive"]):
+                    continue
+
+                if (
+                    int(left_node["token"]),
+                    int(right_node["token"]),
+                ) != best_pair:
+                    continue
+
+                selected.append(
+                    (sequence_index, left_index)
+                )
+
+                last_consumed_right[sequence_index] = right_index
+
+            for sequence_index, left_index in selected:
+                sequence_nodes = nodes[sequence_index]
+                left_node = sequence_nodes[left_index]
+
+                if not bool(left_node["alive"]):
+                    continue
+
+                right_index = int(left_node["next"])
+
+                if right_index == -1:
+                    continue
+
+                right_node = sequence_nodes[right_index]
+
+                if not bool(right_node["alive"]):
+                    continue
+
+                if (
+                    int(left_node["token"]),
+                    int(right_node["token"]),
+                ) != best_pair:
+                    continue
+
+                previous_index = int(left_node["prev"])
+                next_index = int(right_node["next"])
+
+                # Remove all pair occurrences affected by the
+                # structural change.
+                if previous_index != -1:
+                    remove_pair_occurrence(
+                        sequence_index,
+                        previous_index,
+                    )
+
+                remove_pair_occurrence(
+                    sequence_index,
+                    left_index,
+                )
+
+                if next_index != -1:
+                    remove_pair_occurrence(
+                        sequence_index,
+                        right_index,
+                    )
+
+                # Replace left + right with the new token.
+                left_node["token"] = next_token_id
+
+                if next_index != -1:
+                    left_node["next"] = next_index
+                    sequence_nodes[next_index]["prev"] = left_index
+                else:
+                    left_node["next"] = -1
+
+                right_node["alive"] = False
+                right_node["prev"] = -1
+                right_node["next"] = -1
+
+                # Add the newly created neighboring pairs.
+                if previous_index != -1:
+                    add_pair_occurrence(
+                        sequence_index,
+                        previous_index,
+                    )
+
+                add_pair_occurrence(
+                    sequence_index,
+                    left_index,
+                )
 
             next_token_id += 1
 
