@@ -74,47 +74,37 @@ class BPETrainer:
         merges: list[tuple[int, int]] = []
         next_token_id = 256
 
-        # Mutable linked representation of every sequence.
-        #
-        # Each node contains:
-        #   token -> token ID
-        #   prev  -> previous node index
-        #   next  -> next node index
-        #   alive -> whether the node is still active
-        nodes: list[list[dict[str, int | bool]]] = []
+        tokens: list[list[int]] = []
+        prev: list[list[int]] = []
+        next_: list[list[int]] = []
+        alive: list[bytearray] = []
 
         for sequence in sequences:
-            sequence_nodes: list[dict[str, int | bool]] = []
+            length = len(sequence)
 
-            for index, token in enumerate(sequence):
-                sequence_nodes.append(
-                    {
-                        "token": token,
-                        "prev": index - 1,
-                        "next": (
-                            index + 1
-                            if index + 1 < len(sequence)
-                            else -1
-                        ),
-                        "alive": True,
-                    }
-                )
+            tokens.append(list(sequence))
+            prev.append(
+                [
+                    index - 1
+                    for index in range(length)
+                ]
+            )
+            next_.append(
+                [
+                    index + 1
+                    if index + 1 < length
+                    else -1
+                    for index in range(length)
+                ]
+            )
+            alive.append(bytearray(b"\x01" * length))
 
-            nodes.append(sequence_nodes)
-
-        # Current number of occurrences of every adjacent token pair.
         pair_counts: Counter[tuple[int, int]] = Counter()
 
-        # count -> pairs having exactly this count
         pair_buckets: dict[int, set[tuple[int, int]]] = {}
 
-        # Highest currently populated pair-count bucket.
         max_pair_count = 0
 
-        # pair -> {(sequence_index, left_node_index), ...}
-        #
-        # An occurrence identifies the node containing the left token
-        # of the pair.
         pair_occurrences: dict[
             tuple[int, int],
             set[tuple[int, int]],
@@ -160,12 +150,12 @@ class BPETrainer:
             ):
                 max_pair_count -= 1
 
-        for sequence_index, sequence_nodes in enumerate(nodes):
-            for index in range(len(sequence_nodes) - 1):
-                left = int(sequence_nodes[index]["token"])
-                right = int(sequence_nodes[index + 1]["token"])
-
-                pair = (left, right)
+        for sequence_index, sequence_tokens in enumerate(tokens):
+            for index in range(len(sequence_tokens) - 1):
+                pair = (
+                    sequence_tokens[index],
+                    sequence_tokens[index + 1],
+                )
 
                 adjust_pair_count(pair, 1)
 
@@ -203,25 +193,25 @@ class BPETrainer:
             sequence_index: int,
             left_index: int,
         ) -> None:
-            sequence_nodes = nodes[sequence_index]
-            left_node = sequence_nodes[left_index]
+            sequence_tokens = tokens[sequence_index]
+            sequence_prev = prev[sequence_index]
+            sequence_next = next_[sequence_index]
+            sequence_alive = alive[sequence_index]
 
-            if not bool(left_node["alive"]):
+            if not sequence_alive[left_index]:
                 return
 
-            right_index = int(left_node["next"])
+            right_index = sequence_next[left_index]
 
             if right_index == -1:
                 return
 
-            right_node = sequence_nodes[right_index]
-
-            if not bool(right_node["alive"]):
+            if not sequence_alive[right_index]:
                 return
 
             pair = (
-                int(left_node["token"]),
-                int(right_node["token"]),
+                sequence_tokens[left_index],
+                sequence_tokens[right_index],
             )
 
             adjust_pair_count(pair, -1)
@@ -235,25 +225,24 @@ class BPETrainer:
             sequence_index: int,
             left_index: int,
         ) -> None:
-            sequence_nodes = nodes[sequence_index]
-            left_node = sequence_nodes[left_index]
+            sequence_tokens = tokens[sequence_index]
+            sequence_next = next_[sequence_index]
+            sequence_alive = alive[sequence_index]
 
-            if not bool(left_node["alive"]):
+            if not sequence_alive[left_index]:
                 return
 
-            right_index = int(left_node["next"])
+            right_index = sequence_next[left_index]
 
             if right_index == -1:
                 return
 
-            right_node = sequence_nodes[right_index]
-
-            if not bool(right_node["alive"]):
+            if not sequence_alive[right_index]:
                 return
 
             pair = (
-                int(left_node["token"]),
-                int(right_node["token"]),
+                sequence_tokens[left_index],
+                sequence_tokens[right_index],
             )
 
             adjust_pair_count(pair, 1)
@@ -268,10 +257,6 @@ class BPETrainer:
                 break
 
             bucket = pair_buckets[max_pair_count]
-
-            # Preserve the original deterministic tie-break:
-            # highest count, then highest left token ID,
-            # then highest right token ID.
             best_pair = max(bucket)
 
             left_token, right_token = best_pair
@@ -294,8 +279,6 @@ class BPETrainer:
                     "best BPE pair has no occurrences"
                 )
 
-            # Work from left to right to preserve the exact
-            # non-overlapping semantics of merge_pair().
             selected: list[tuple[int, int]] = []
 
             last_consumed_right: dict[int, int] = {}
@@ -308,31 +291,27 @@ class BPETrainer:
                     -1,
                 )
 
-                # If this node was consumed as the right side of
-                # the preceding occurrence, this occurrence overlaps
-                # and must be skipped.
                 if left_index <= previous_right:
                     continue
 
-                sequence_nodes = nodes[sequence_index]
-                left_node = sequence_nodes[left_index]
+                sequence_tokens = tokens[sequence_index]
+                sequence_next = next_[sequence_index]
+                sequence_alive = alive[sequence_index]
 
-                if not bool(left_node["alive"]):
+                if not sequence_alive[left_index]:
                     continue
 
-                right_index = int(left_node["next"])
+                right_index = sequence_next[left_index]
 
                 if right_index == -1:
                     continue
 
-                right_node = sequence_nodes[right_index]
-
-                if not bool(right_node["alive"]):
+                if not sequence_alive[right_index]:
                     continue
 
                 if (
-                    int(left_node["token"]),
-                    int(right_node["token"]),
+                    sequence_tokens[left_index],
+                    sequence_tokens[right_index],
                 ) != best_pair:
                     continue
 
@@ -343,33 +322,31 @@ class BPETrainer:
                 last_consumed_right[sequence_index] = right_index
 
             for sequence_index, left_index in selected:
-                sequence_nodes = nodes[sequence_index]
-                left_node = sequence_nodes[left_index]
+                sequence_tokens = tokens[sequence_index]
+                sequence_prev = prev[sequence_index]
+                sequence_next = next_[sequence_index]
+                sequence_alive = alive[sequence_index]
 
-                if not bool(left_node["alive"]):
+                if not sequence_alive[left_index]:
                     continue
 
-                right_index = int(left_node["next"])
+                right_index = sequence_next[left_index]
 
                 if right_index == -1:
                     continue
 
-                right_node = sequence_nodes[right_index]
-
-                if not bool(right_node["alive"]):
+                if not sequence_alive[right_index]:
                     continue
 
                 if (
-                    int(left_node["token"]),
-                    int(right_node["token"]),
+                    sequence_tokens[left_index],
+                    sequence_tokens[right_index],
                 ) != best_pair:
                     continue
 
-                previous_index = int(left_node["prev"])
-                next_index = int(right_node["next"])
+                previous_index = sequence_prev[left_index]
+                next_index = sequence_next[right_index]
 
-                # Remove all pair occurrences affected by the
-                # structural change.
                 if previous_index != -1:
                     remove_pair_occurrence(
                         sequence_index,
@@ -387,20 +364,18 @@ class BPETrainer:
                         right_index,
                     )
 
-                # Replace left + right with the new token.
-                left_node["token"] = next_token_id
+                sequence_tokens[left_index] = next_token_id
 
                 if next_index != -1:
-                    left_node["next"] = next_index
-                    sequence_nodes[next_index]["prev"] = left_index
+                    sequence_next[left_index] = next_index
+                    sequence_prev[next_index] = left_index
                 else:
-                    left_node["next"] = -1
+                    sequence_next[left_index] = -1
 
-                right_node["alive"] = False
-                right_node["prev"] = -1
-                right_node["next"] = -1
+                sequence_alive[right_index] = 0
+                sequence_prev[right_index] = -1
+                sequence_next[right_index] = -1
 
-                # Add the newly created neighboring pairs.
                 if previous_index != -1:
                     add_pair_occurrence(
                         sequence_index,
