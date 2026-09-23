@@ -25,7 +25,7 @@ tokenizer.json
 
 # Local datasets / corpora
 corpus.txt
-data/
+/data/
 
 # Experiment outputs
 experiments/
