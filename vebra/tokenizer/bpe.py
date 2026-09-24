@@ -99,8 +99,6 @@ class BPETrainer:
             )
             alive.append(bytearray(b"\x01" * length))
 
-        pair_counts: Counter[tuple[int, int]] = Counter()
-
         pair_buckets: dict[int, set[tuple[int, int]]] = {}
 
         max_pair_count = 0
@@ -116,7 +114,14 @@ class BPETrainer:
         ) -> None:
             nonlocal max_pair_count
 
-            old_count = pair_counts.get(pair, 0)
+            occurrences = pair_occurrences.get(pair)
+
+            old_count = (
+                len(occurrences)
+                if occurrences is not None
+                else 0
+            )
+
             new_count = old_count + delta
 
             if new_count < 0:
@@ -131,11 +136,7 @@ class BPETrainer:
                 if not bucket:
                     pair_buckets.pop(old_count)
 
-            if new_count == 0:
-                pair_counts.pop(pair, None)
-            else:
-                pair_counts[pair] = new_count
-
+            if new_count > 0:
                 pair_buckets.setdefault(
                     new_count,
                     set(),
@@ -150,21 +151,14 @@ class BPETrainer:
             ):
                 max_pair_count -= 1
 
-        for sequence_index, sequence_tokens in enumerate(tokens):
-            for index in range(len(sequence_tokens) - 1):
-                pair = (
-                    sequence_tokens[index],
-                    sequence_tokens[index + 1],
-                )
-
-                adjust_pair_count(pair, 1)
-
-                pair_occurrences.setdefault(
-                    pair,
-                    set(),
-                ).add(
-                    (sequence_index, index)
-                )
+        def add_occurrence(
+            pair: tuple[int, int],
+            occurrence: tuple[int, int],
+        ) -> None:
+            pair_occurrences.setdefault(
+                pair,
+                set(),
+            ).add(occurrence)
 
         def remove_occurrence(
             pair: tuple[int, int],
@@ -180,21 +174,25 @@ class BPETrainer:
             if not occurrences:
                 pair_occurrences.pop(pair, None)
 
-        def add_occurrence(
-            pair: tuple[int, int],
-            occurrence: tuple[int, int],
-        ) -> None:
-            pair_occurrences.setdefault(
-                pair,
-                set(),
-            ).add(occurrence)
+        for sequence_index, sequence_tokens in enumerate(tokens):
+            for index in range(len(sequence_tokens) - 1):
+                pair = (
+                    sequence_tokens[index],
+                    sequence_tokens[index + 1],
+                )
+
+                adjust_pair_count(pair, 1)
+
+                add_occurrence(
+                    pair,
+                    (sequence_index, index),
+                )
 
         def remove_pair_occurrence(
             sequence_index: int,
             left_index: int,
         ) -> None:
             sequence_tokens = tokens[sequence_index]
-            sequence_prev = prev[sequence_index]
             sequence_next = next_[sequence_index]
             sequence_alive = alive[sequence_index]
 
